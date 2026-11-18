@@ -6,6 +6,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { VIEWER_ID, VIEWER_LOGIN, VIEWER_NAME } from './store.ts';
 import { registerRepos } from './repos.ts';
 import { registerContents } from './contents.ts';
+import { registerIssues } from './issues.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -155,6 +156,7 @@ export function createApp(): Server {
   // === feature modules ===
   registerRepos(router);
   registerContents(router);
+  registerIssues(router);
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     const requestId = randomUUID();
