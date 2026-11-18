@@ -30,8 +30,15 @@ function tipTree(repo: RepoRec, branch: string): { tip?: string; treeOid: string
   return { tip, treeOid: parseCommit(obj.data).tree };
 }
 
-function commitFiles(repo: RepoRec, branch: string, files: Map<string, string>, message: string): string {
-  const treeOid = buildTreeFromFiles(repo, files);
+function commitFiles(
+  repo: RepoRec,
+  branch: string,
+  files: Map<string, string | { oid: string; mode: string }>,
+  message: string,
+): string {
+  const clean = new Map<string, string>();
+  for (const [path, v] of files) clean.set(path, typeof v === 'string' ? v : v.oid);
+  const treeOid = buildTreeFromFiles(repo, clean);
   const { tip } = tipTree(repo, branch);
   const now = tickEpochSec();
   const data = buildCommitData({
