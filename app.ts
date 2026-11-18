@@ -9,6 +9,7 @@ import { registerContents } from './contents.ts';
 import { registerIssues } from './issues.ts';
 import { registerPulls } from './pulls.ts';
 import { registerGit } from './gitproto.ts';
+import { registerGraphql } from './graphql.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -161,6 +162,7 @@ export function createApp(): Server {
   registerIssues(router);
   registerPulls(router);
   registerGit(router);
+  registerGraphql(router);
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     const requestId = randomUUID();
