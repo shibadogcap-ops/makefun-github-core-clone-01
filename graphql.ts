@@ -88,7 +88,7 @@ function tokenize(src: string): Tok[] {
       i += 3;
       continue;
     }
-    if ('{}():$![=.'.includes(c)) {
+    if ('{}():$![]=.'.includes(c)) {
       toks.push({ t: 'punct', v: c });
       i += 1;
       continue;
@@ -204,30 +204,20 @@ class Parser {
         this.next();
         this.value();
       }
-      if (!this.atPunct(')')) throw new Error('Syntax error: expected )');
     }
     this.expectPunct(')');
   }
 
+  // Type := (Name | '[' Type ']') '!'
   typeRef(): void {
-    this.expectName();
-    for (;;) {
-      if (this.atPunct('!')) {
-        this.next();
-        continue;
-      }
-      if (this.atPunct('[')) {
-        let depth = 0;
-        do {
-          const t = this.next();
-          if (t.t === 'punct' && t.v === '[') depth += 1;
-          else if (t.t === 'punct' && t.v === ']') depth -= 1;
-          else if (t.t === 'eof') throw new Error('Syntax error: unterminated type');
-        } while (depth > 0);
-        continue;
-      }
-      return;
+    if (this.atPunct('[')) {
+      this.next();
+      this.typeRef();
+      this.expectPunct(']');
+    } else {
+      this.expectName();
     }
+    if (this.atPunct('!')) this.next();
   }
 
   selectionSet(): Sel[] {
@@ -281,7 +271,6 @@ class Parser {
         const key = this.peek().t === 'str' ? (this.next().v as string) : this.expectName();
         this.expectPunct(':');
         f.args[key] = this.value();
-        if (!this.atPunct(')')) throw new Error('Syntax error: expected )');
       }
       this.expectPunct(')');
     }
@@ -299,7 +288,6 @@ class Parser {
       while (!this.atPunct(']')) {
         if (this.peek().t === 'eof') throw new Error('Syntax error: unterminated list');
         arr.push(this.value());
-        if (!this.atPunct(']')) throw new Error('Syntax error: expected ]');
       }
       this.expectPunct(']');
       return arr;
@@ -311,7 +299,6 @@ class Parser {
         const key = this.peek().t === 'str' ? (this.next().v as string) : this.expectName();
         this.expectPunct(':');
         obj[key] = this.value();
-        if (!this.atPunct('}')) throw new Error('Syntax error: expected }');
       }
       this.expectPunct('}');
       return obj;

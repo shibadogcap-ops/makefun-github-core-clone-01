@@ -76,8 +76,12 @@ export function registerIssues(router: Router): void {
     if (typeof name !== 'string' || name === '') {
       throw new HttpError(422, 'Validation Failed: name is required');
     }
-    if (repo.labels.has(name)) {
-      throw new HttpError(422, 'Validation Failed: name already exists');
+    const existing = repo.labels.get(name);
+    if (existing !== undefined) {
+      existing.color = typeof body.color === 'string' ? body.color : existing.color;
+      if (typeof body.description === 'string') existing.description = body.description;
+      ctx.json(201, labelJson(existing));
+      return;
     }
     const label: LabelRec = {
       name,
