@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { VIEWER_ID, VIEWER_LOGIN, VIEWER_NAME } from './store.ts';
 import { registerRepos } from './repos.ts';
+import { registerContents } from './contents.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -153,6 +154,7 @@ export function createApp(): Server {
 
   // === feature modules ===
   registerRepos(router);
+  registerContents(router);
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     const requestId = randomUUID();
