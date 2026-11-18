@@ -2,7 +2,7 @@
 // v2 ls-refs command. Pure protocol code; routes live in registerGit below.
 
 import { DEFAULT_BRANCH, getRepo, type RepoRec } from './store.ts';
-import { parseTag } from './gitobj.ts';
+import { parseCommit, parseTag, parseTree, writePack } from './gitobj.ts';
 import type { Ctx, Router } from './app.ts';
 
 export const ZERO_OID = '0'.repeat(40);
@@ -157,6 +157,354 @@ export function advertisement(ctx: Ctx, repo: RepoRec, service: 'git-upload-pack
   ctx.send(200, Buffer.concat(parts), `application/x-${service}-advertisement`);
 }
 
+// Full object closure with a single cut: a commit whose sha is in stopAt is
+// included with its tree closure but its parents are not followed. Trees,
+// blobs and tags always expand fully (tags follow to their object).
+function closure(repo: RepoRec, tips: string[], stopAt: ReadonlySet<string>): Set<string> {
+  const seen = new Set<string>();
+  const stack = [...tips];
+  while (stack.length > 0) {
+    const sha = stack.pop()!;
+    if (seen.has(sha)) continue;
+    const obj = repo.objects.get(sha);
+    if (obj === undefined) continue;
+    seen.add(sha);
+    if (obj.type === 'commit') {
+      const c = parseCommit(obj.data);
+      stack.push(c.tree);
+      if (!stopAt.has(sha)) for (const p of c.parents) stack.push(p);
+    } else if (obj.type === 'tree') {
+      for (const e of parseTree(obj.data)) stack.push(e.oid);
+    } else if (obj.type === 'tag') {
+      stack.push(parseTag(obj.data).object);
+    }
+  }
+  return seen;
+}
+
+export interface FetchRequest {
+  wants: string[];
+  haves: string[];
+  clientShallow: string[];
+  depth?: number;
+}
+
+function commitParents(repo: RepoRec, sha: string): string[] {
+  const obj = repo.objects.get(sha);
+  if (obj === undefined || obj.type !== 'commit') return [];
+  return parseCommit(obj.data).parents;
+}
+
+function commitTree(repo: RepoRec, sha: string): string {
+  const obj = repo.objects.get(sha);
+  if (obj === undefined || obj.type !== 'commit') return '';
+  return parseCommit(obj.data).tree;
+}
+
+function orderSend(repo: RepoRec, set: Set<string>): string[] {
+  const groups: Record<string, string[]> = { commit: [], tree: [], blob: [], tag: [] };
+  for (const sha of set) {
+    const t = repo.objects.get(sha)?.type;
+    if (t !== undefined && t in groups) groups[t].push(sha);
+  }
+  const out: string[] = [];
+  for (const t of ['commit', 'tree', 'blob', 'tag']) {
+    groups[t].sort();
+    out.push(...groups[t]);
+  }
+  return out;
+}
+
+export function planFetch(
+  repo: RepoRec,
+  req: FetchRequest,
+): { send: string[]; shallow: string[]; unshallow: string[] } {
+  const clientShallowSet = new Set(req.clientShallow);
+
+  const haveSet = new Set<string>();
+  for (const h of req.haves) {
+    if (!repo.objects.has(h)) continue;
+    for (const s of closure(repo, [h], clientShallowSet)) haveSet.add(s);
+  }
+
+  const sendSet = new Set<string>();
+  let shallow: string[] = [];
+  let unshallow: string[] = [];
+
+  const depth = req.depth;
+  if (depth === undefined || depth <= 0) {
+    for (const w of req.wants) {
+      for (const s of closure(repo, [w], clientShallowSet)) sendSet.add(s);
+    }
+  } else {
+    // Level the commits: BFS from each want's peeled commit. A commit at level
+    // L expands to parents at L+1 only while L + 1 < depth, so commits at
+    // level depth - 1 are included but not expanded (the shallow boundary).
+    const levels = new Map<string, number>();
+    const queue: string[] = [];
+    for (const w of req.wants) {
+      const c = peelToCommit(repo, w);
+      if (repo.objects.get(c)?.type === 'commit' && !levels.has(c)) {
+        levels.set(c, 0);
+        queue.push(c);
+      }
+    }
+    for (let qi = 0; qi < queue.length; qi++) {
+      const sha = queue[qi];
+      const level = levels.get(sha)!;
+      if (level + 1 >= depth) continue;
+      for (const p of commitParents(repo, sha)) {
+        const pc = peelToCommit(repo, p);
+        if (repo.objects.get(pc)?.type === 'commit' && !levels.has(pc)) {
+          levels.set(pc, level + 1);
+          queue.push(pc);
+        }
+      }
+    }
+
+    const boundary = new Set<string>();
+    for (const [sha, level] of levels) {
+      if (level === depth - 1 && commitParents(repo, sha).length > 0) boundary.add(sha);
+    }
+
+    // Every included commit plus the closure of its tree.
+    for (const sha of levels.keys()) {
+      sendSet.add(sha);
+      const tree = commitTree(repo, sha);
+      if (tree !== '') {
+        for (const s of closure(repo, [tree], clientShallowSet)) sendSet.add(s);
+      }
+    }
+    // Wants that do not peel to a commit still send their full closure.
+    for (const w of req.wants) {
+      const c = peelToCommit(repo, w);
+      if (repo.objects.get(c)?.type !== 'commit') {
+        for (const s of closure(repo, [w], clientShallowSet)) sendSet.add(s);
+      }
+    }
+    // Want tag objects and their peeled chain down to the commit.
+    for (const w of req.wants) {
+      let cur = w;
+      const seen = new Set<string>();
+      while (!seen.has(cur)) {
+        seen.add(cur);
+        const obj = repo.objects.get(cur);
+        if (obj === undefined || obj.type !== 'tag') break;
+        sendSet.add(cur);
+        cur = parseTag(obj.data).object;
+      }
+    }
+
+    shallow = [...boundary].filter((o) => !clientShallowSet.has(o));
+    unshallow = req.clientShallow.filter((o) => levels.has(o) && !boundary.has(o));
+  }
+
+  for (const h of haveSet) sendSet.delete(h);
+  return { send: orderSend(repo, sendSet), shallow, unshallow };
+}
+
+export function isAncestor(repo: RepoRec, anc: string, desc: string): boolean {
+  const target = peelToCommit(repo, anc);
+  const stack = [peelToCommit(repo, desc)];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (cur === target) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    const obj = repo.objects.get(cur);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    for (const p of parseCommit(obj.data).parents) stack.push(peelToCommit(repo, p));
+  }
+  return false;
+}
+
+function sidebandChunks(pack: Buffer): Buffer[] {
+  const out: Buffer[] = [];
+  for (let i = 0; i < pack.length; i += 32768) {
+    out.push(pktLine(Buffer.concat([Buffer.from([1]), pack.subarray(i, i + 32768)])));
+  }
+  return out;
+}
+
+function packFor(repo: RepoRec, send: string[]): Buffer {
+  const objects = send
+    .map((sha) => repo.objects.get(sha))
+    .filter((o): o is { type: 'blob' | 'tree' | 'commit' | 'tag'; data: Buffer } => o !== undefined);
+  return writePack(objects);
+}
+
+function firstArgOid(line: string, prefix: string): string | undefined {
+  if (!line.startsWith(prefix)) return undefined;
+  const rest = line.slice(prefix.length).trim();
+  if (rest === '') return undefined;
+  return rest.split(/\s+/)[0];
+}
+
+function fetchPlanArgs(packets: PktPacket[]): {
+  wants: string[];
+  haves: string[];
+  clientShallow: string[];
+  depth?: number;
+  done: boolean;
+} {
+  const wants: string[] = [];
+  const haves: string[] = [];
+  const clientShallow: string[] = [];
+  let depth: number | undefined;
+  let done = false;
+  const delimIdx = packets.findIndex((p) => p.kind === 'delim');
+  const argPackets = delimIdx === -1 ? [] : packets.slice(delimIdx + 1);
+  for (const p of argPackets) {
+    if (p.kind !== 'data') continue;
+    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    if (line === 'done') {
+      done = true;
+      continue;
+    }
+    const want = firstArgOid(line, 'want ');
+    if (want !== undefined) {
+      wants.push(want);
+      continue;
+    }
+    const have = firstArgOid(line, 'have ');
+    if (have !== undefined) {
+      haves.push(have);
+      continue;
+    }
+    const shallow = firstArgOid(line, 'shallow ');
+    if (shallow !== undefined) {
+      clientShallow.push(shallow);
+      continue;
+    }
+    if (line.startsWith('deepen ')) {
+      const n = Number.parseInt(line.slice('deepen '.length), 10);
+      if (Number.isFinite(n) && n > 0) depth = n;
+    }
+    // 'deepen-since', 'deepen-not', 'thin-pack', 'ofs-delta',
+    // 'no-progress', 'filter ...' and anything else is ignored.
+  }
+  return { wants, haves, clientShallow, depth, done };
+}
+
+function commonHave(repo: RepoRec, haves: string[]): string | undefined {
+  for (const h of haves) {
+    if (repo.objects.has(h)) return h;
+  }
+  return undefined;
+}
+
+function handleFetchV2(ctx: Ctx, repo: RepoRec, packets: PktPacket[]): void {
+  const req = fetchPlanArgs(packets);
+  const { done, ...fetchReq } = req;
+  const plan = planFetch(repo, fetchReq);
+  const have = commonHave(repo, req.haves);
+
+  const parts: Buffer[] = [];
+
+  if (!done) {
+    // Negotiation round: the client expects an acknowledgments section. A
+    // common have means the pack can be sent now ('ready' + DELIM); without
+    // one we NAK and end the response so the client sends more haves.
+    parts.push(pktLine('acknowledgments\n'));
+    if (have === undefined) {
+      parts.push(pktLine('NAK\n'), PKT_FLUSH);
+      ctx.send(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      return;
+    }
+    parts.push(pktLine(`ACK ${have}\n`), pktLine('ready\n'), PKT_DELIM);
+  }
+
+  if (plan.shallow.length + plan.unshallow.length > 0) {
+    parts.push(pktLine('shallow-info\n'));
+    for (const o of plan.shallow) parts.push(pktLine(`shallow ${o}\n`));
+    for (const o of plan.unshallow) parts.push(pktLine(`unshallow ${o}\n`));
+    parts.push(PKT_DELIM);
+  }
+  parts.push(pktLine('packfile\n'));
+  parts.push(...sidebandChunks(packFor(repo, plan.send)));
+  parts.push(PKT_FLUSH);
+  ctx.send(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+}
+
+function handleFetchV0(ctx: Ctx, repo: RepoRec, parsed: { packets: PktPacket[]; rest: Buffer }): void {
+  const wants: string[] = [];
+  const clientShallow: string[] = [];
+  let depth: number | undefined;
+  for (const p of parsed.packets) {
+    if (p.kind !== 'data') continue;
+    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    const want = firstArgOid(line, 'want ');
+    if (want !== undefined) {
+      wants.push(want);
+      continue;
+    }
+    const shallow = firstArgOid(line, 'shallow ');
+    if (shallow !== undefined) {
+      clientShallow.push(shallow);
+      continue;
+    }
+    if (line.startsWith('deepen ')) {
+      const n = Number.parseInt(line.slice('deepen '.length), 10);
+      if (Number.isFinite(n) && n > 0) depth = n;
+    }
+  }
+
+  let havePackets: PktPacket[];
+  try {
+    havePackets = parsePktLines(parsed.rest).packets;
+  } catch {
+    ctx.send(400, 'invalid pkt-line', 'text/plain');
+    return;
+  }
+  const haves: string[] = [];
+  let done = false;
+  let haveData = false;
+  for (const p of havePackets) {
+    if (p.kind !== 'data') continue;
+    haveData = true;
+    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    if (line === 'done') {
+      done = true;
+      continue;
+    }
+    const have = firstArgOid(line, 'have ');
+    if (have !== undefined) haves.push(have);
+  }
+
+  const plan = planFetch(repo, { wants, haves, clientShallow, depth });
+  const have = commonHave(repo, haves);
+
+  const parts: Buffer[] = [];
+  let shallowLines = 0;
+  for (const o of plan.shallow) {
+    parts.push(pktLine(`shallow ${o}\n`));
+    shallowLines += 1;
+  }
+  for (const o of plan.unshallow) {
+    parts.push(pktLine(`unshallow ${o}\n`));
+    shallowLines += 1;
+  }
+  // A shallow list is its own block, terminated by a flush, before the
+  // ACK/NAK and pack data (mirrors upload-pack's send_shallow_list).
+  if (shallowLines > 0) parts.push(PKT_FLUSH);
+
+  if (!haveData) {
+    // Want-section-only request (e.g. the first leg of a v0 deepen fetch):
+    // the shallow list is the whole answer.
+    if (shallowLines === 0) parts.push(PKT_FLUSH);
+    ctx.send(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+    return;
+  }
+
+  parts.push(have !== undefined ? pktLine(`ACK ${have}\n`) : pktLine('NAK\n'));
+  // The pack goes out once the client says 'done'; mid-negotiation have
+  // blocks get just the ACK/NAK and the client sends more haves.
+  if (done && plan.send.length > 0) parts.push(...sidebandChunks(packFor(repo, plan.send)));
+  parts.push(PKT_FLUSH);
+  ctx.send(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+}
+
 export function registerGit(router: Router): void {
   router.add('GET', '/{owner}/{repo}.git/info/refs', (ctx: Ctx) => {
     const repo = getRepo(ctx.params.owner, ctx.params.repo);
@@ -187,8 +535,21 @@ export function registerGit(router: Router): void {
       return;
     }
     const first = parsed.packets.find((p) => p.kind === 'data');
-    if (first === undefined || !first.payload.toString('utf8').startsWith('command=ls-refs')) {
-      ctx.send(501, 'not implemented yet', 'text/plain');
+    if (first === undefined) {
+      ctx.send(400, 'invalid request', 'text/plain');
+      return;
+    }
+    const head = first.payload.toString('utf8');
+    if (head.startsWith('command=fetch')) {
+      handleFetchV2(ctx, repo, parsed.packets);
+      return;
+    }
+    if (head.startsWith('want ')) {
+      handleFetchV0(ctx, repo, parsed);
+      return;
+    }
+    if (!head.startsWith('command=ls-refs')) {
+      ctx.send(400, 'unsupported request', 'text/plain');
       return;
     }
 
