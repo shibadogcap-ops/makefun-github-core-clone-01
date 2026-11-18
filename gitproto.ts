@@ -2,7 +2,7 @@
 // v2 ls-refs command. Pure protocol code; routes live in registerGit below.
 
 import { DEFAULT_BRANCH, getRepo, type RepoRec } from './store.ts';
-import { parseCommit, parseTag, parseTree, writePack } from './gitobj.ts';
+import { parseCommit, parseTag, parseTree, readPack, writePack } from './gitobj.ts';
 import type { Ctx, Router } from './app.ts';
 
 export const ZERO_OID = '0'.repeat(40);
@@ -582,5 +582,118 @@ export function registerGit(router: Router): void {
     }
     out.push(PKT_FLUSH);
     ctx.send(200, Buffer.concat(out), 'application/x-git-upload-pack-result');
+  });
+
+  router.add('POST', '/{owner}/{repo}.git/git-receive-pack', (ctx: Ctx) => {
+    const repo = getRepo(ctx.params.owner, ctx.params.repo);
+    if (repo === undefined) {
+      ctx.json(404, { message: 'Not Found' });
+      return;
+    }
+
+    let parsed: { packets: PktPacket[]; rest: Buffer };
+    try {
+      parsed = parsePktLines(ctx.rawBody);
+    } catch {
+      ctx.send(400, 'invalid pkt-line', 'text/plain');
+      return;
+    }
+
+    const commands: Array<{ oldOid: string; newOid: string; ref: string }> = [];
+    let caps = '';
+    let firstCmd = true;
+    for (const p of parsed.packets) {
+      if (p.kind !== 'data') continue;
+      const line = p.payload.toString('utf8').replace(/\n$/, '');
+      const sp1 = line.indexOf(' ');
+      if (sp1 === -1) continue;
+      const sp2 = line.indexOf(' ', sp1 + 1);
+      if (sp2 === -1) continue;
+      const oldOid = line.slice(0, sp1);
+      const newOid = line.slice(sp1 + 1, sp2);
+      let refPart = line.slice(sp2 + 1);
+      let capPart = '';
+      const nul = refPart.indexOf('\0');
+      if (nul !== -1) {
+        capPart = refPart.slice(nul + 1);
+        refPart = refPart.slice(0, nul);
+      }
+      if (firstCmd) {
+        caps = capPart;
+        firstCmd = false;
+      }
+      commands.push({ oldOid, newOid, ref: refPart });
+    }
+
+    let unpackOk = true;
+    let unpackErr = '';
+    if (parsed.rest.length > 0) {
+      try {
+        const objects = readPack(parsed.rest, (oid) => repo.objects.get(oid));
+        for (const o of objects) {
+          if (!repo.objects.has(o.oid)) {
+            repo.objects.set(o.oid, { type: o.type as 'blob' | 'tree' | 'commit' | 'tag', data: o.data });
+          }
+        }
+      } catch (e) {
+        unpackOk = false;
+        unpackErr = e instanceof Error ? e.message.split('\n')[0] : 'unpack failed';
+        if (unpackErr.length > 80) unpackErr = unpackErr.slice(0, 80);
+      }
+    }
+
+    const lines: string[] = [unpackOk ? 'unpack ok' : `unpack ${unpackErr}`];
+    for (const cmd of commands) {
+      const current = repo.refs.get(cmd.ref) ?? ZERO_OID;
+      if (!unpackOk) {
+        lines.push(`ng ${cmd.ref} unpack failed`);
+        continue;
+      }
+      if (cmd.oldOid !== current) {
+        lines.push(`ng ${cmd.ref} old value does not match`);
+        continue;
+      }
+      if (cmd.newOid === ZERO_OID) {
+        if (current === ZERO_OID) {
+          lines.push(`ng ${cmd.ref} ref does not exist`);
+        } else {
+          repo.refs.delete(cmd.ref);
+          lines.push(`ok ${cmd.ref}`);
+        }
+        continue;
+      }
+      const obj = repo.objects.get(cmd.newOid);
+      if (obj === undefined) {
+        lines.push(`ng ${cmd.ref} not a valid object`);
+        continue;
+      }
+      if (cmd.ref.startsWith('refs/heads/') && current !== ZERO_OID) {
+        const curCommit = peelToCommit(repo, current);
+        const newCommit = peelToCommit(repo, cmd.newOid);
+        if (newCommit !== curCommit && !isAncestor(repo, curCommit, newCommit)) {
+          lines.push(`ng ${cmd.ref} non-fast-forward`);
+          continue;
+        }
+      }
+      repo.refs.set(cmd.ref, cmd.newOid);
+      lines.push(`ok ${cmd.ref}`);
+    }
+
+    const innerParts: Buffer[] = lines.map((l) => pktLine(l + '\n'));
+    innerParts.push(PKT_FLUSH);
+    const inner = Buffer.concat(innerParts);
+
+    let body: Buffer;
+    if (caps.split(' ').includes('side-band-64k')) {
+      const chunks: Buffer[] = [];
+      for (let i = 0; i < inner.length; i += 32768) {
+        chunks.push(pktLine(Buffer.concat([Buffer.from([1]), inner.subarray(i, i + 32768)])));
+      }
+      chunks.push(PKT_FLUSH);
+      body = Buffer.concat(chunks);
+    } else {
+      body = inner;
+    }
+    ctx.send(200, body, 'application/x-git-receive-pack-result');
   });
 }
